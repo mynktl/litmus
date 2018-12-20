@@ -1,0 +1,86 @@
+---
+- name: Install tc command on targeted replica pod
+      shell: kubectl exec -it {{ targeted_replica_pod }} -n {{ operator_ns }} --container cstor-pool -- bash -c "apt-get update && apt-get -y install iproute2"
+      register: tc_apt_output
+
+- name: Initialize queue on target pod
+  shell: kubectl exec -it {{ targeted_replica_pod }} -n {{ operator_ns }} --container cstor-pool --bash -c "tc qdisc show dev eth0  |grep prio || $(tc qdisc add dev eth0 root handle 1: prio && tc qdisc add dev eth0 parent 1:3 handle 30: netem loss 100.00)"
+  register: tc_output
+
+- block:
+    - name: Obtaining the target IP address
+      shell: kubectl get pods {{ istgt_pod.stdout }} -n openebs   -o=jsonpath='{.status.podIP}'
+      register: istgt_ip
+
+    - name: Disconnect replica from target
+      shell: kubectl exec -it {{ targeted_replica_pod }} -n {{ operator_ns }} --container cstor-pool -- bash -c "tc filter add dev eth0 protocol ip parent 1:0 prio 3 u32 match ip dst {{ istgt_ip.stdout }} flowid 1:3"
+      register: tc_output
+
+    - name: Check if targeted replica is disconnected
+      shell: kubectl exec -it {{ istgt_replica.stdout }} -n {{ operator_ns }} --container  cstor-istgt -- istgtcontrol -q replica |json_pp |grep "\"replicaId" |awk -F ':' '{print $2}' | tr -d ',' |wc -l
+      register: connected_replica
+      until: "connected_replica.stdout == \"2\""
+      delay: 30
+      retries: 10
+
+  when: action == "disconnect_target"
+
+- block:
+    - name: Obtaining the target IP address
+      shell: kubectl get pods {{ istgt_pod.stdout }} -n openebs   -o=jsonpath='{.status.podIP}'
+      register: istgt_ip
+
+    - name: Connect replica to target
+      shell: kubectl exec -it {{ targeted_replica_pod }} -n {{ operator_ns }} --container cstor-pool -- bash -c "IP_ADDR={{ istgt_ip.stdout }}; hex_ip=`printf '%02x' ${IP_ADDR//./ }`; tc_handle=`tc filter  show dev eth0 protocol ip parent 1:0 prio 3    |grep $hex_ip -B 1 |grep -v $hex_ip |awk -F ' ' '{print $4}'` && tc filter del dev eth0 parent 1: handle $tc_handle prio 3 protocol ip u32"
+      register: apt_rc
+
+    - name: Wait until all replica gets connected
+      shell: kubectl exec -it {{ istgt_replica.stdout }} -n {{ operator_ns }} --container  cstor-istgt -- istgtcontrol -q replica |json_pp |grep "\"replicaId" |awk -F ':' '{print $2}' | tr -d ',' |wc -l
+      register: connected_replica
+      until: "connected_replica.stdout == \"3\""
+      delay: 30
+      retries: 10
+  
+  when: action == "connect_target"
+
+- block:
+    - name: Get current iostats from target
+      shell: kubectl exec -it {{ istgt_replica.stdout }} -n {{ operator_ns }} --container cstor-istgt -- istgtcontrol -q iostats |json_pp| grep WriteIOPS |awk -F ':' '{print $2}' | tr -d -c 0-9
+      register: last_iostats
+
+    - name: Generate database name
+      shell: cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
+      register: new_db_name
+
+    - name: Create new database in the mysql
+      include_tasks: "/common/utils/mysql_data_persistence.yml"
+      vars:
+        status: 'LOAD'
+        ns: "{{ app_ns }}"
+        pod_name: "{{ app_pod.stdout }}"
+        dbuser: 'root'
+        dbpassword: 'k8sDem0'
+        dbname: "{{ new_db_name.stdout }}"
+
+    - name: Check if target got any new write IOs
+      shell: kubectl exec -it {{ istgt_replica.stdout }} -n {{ operator_ns }} --container cstor-istgt -- istgtcontrol -q iostats |json_pp| grep WriteIOPS |awk -F ':' '{print $2}' | tr -d -c 0-9
+      register: iostats
+      retries: 10
+      delay: 3
+      until: iostats.stdout != last_iostats.stdout
+    when: action == "dump_ios"
+
+
+- block:
+    - name: Disconnect replica from target
+      shell: kubectl exec -it {{ targeted_replica_pod }} -n {{ operator_ns }} --container cstor-pool -- bash -c "tc filter add dev eth0 protocol ip parent 1:0 prio 3 u32 match ip dst {{ block_ip }} flowid 1:3"
+      register: tc_output
+
+  when: action == "disconnect_ip"
+
+- block:
+    - name: Connect replica to target
+      shell: kubectl exec -it {{ targeted_replica_pod }} -n {{ operator_ns }} --container cstor-pool -- bash -c "IP_ADDR={{ blocked_ip.stdout }}; hex_ip=`printf '%02x' ${IP_ADDR//./ }`; tc_handle=`tc filter  show dev eth0 protocol ip parent 1:0 prio 3    |grep $hex_ip -B 1 |grep -v $hex_ip |awk -F ' ' '{print $4}'` && tc filter del dev eth0 parent 1: handle $tc_handle prio 3 protocol ip u32"
+      register: apt_rc
+  
+  when: action == "connect_ip"

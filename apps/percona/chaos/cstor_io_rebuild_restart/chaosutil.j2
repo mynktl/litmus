@@ -1,0 +1,5 @@
+{% if stg_prov is defined and stg_prov == 'openebs.io/provisioner-iscsi' %}
+  {% if stg_engine is defined and stg_engine == 'cstor' %}
+    chaosutil: openebs/cstor_replica_io_rebuild_restart.yaml
+  {% endif %}
+{% endif %}
